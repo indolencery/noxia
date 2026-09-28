@@ -1,0 +1,17 @@
+# Env
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Logs
+*.log
+/tmp/
+
+# Noxia caches
+downloads-history.json
+download-history.json
+cache/

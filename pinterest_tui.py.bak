@@ -1,0 +1,632 @@
+#!/home/tay/Downloads/pinterest-tui/venv/bin/python3
+"""
+Textual TUI for the pin / pinterest-downloader.py toolchain.
+
+This runs the existing `pin` script as a subprocess rather than importing
+pinterest-downloader.py directly. Two reasons: pinterest-downloader.py does a
+lot of direct terminal writes (raw \\r progress bars, ANSI color codes) that
+would corrupt a full-screen TUI's display if it wrote into the same terminal,
+and it has a couple of process-level side effects at import time (a UA fetch,
+a unicode-support check that can sys.exit). Running it as a subprocess keeps
+all of that fully isolated — neither script needs any changes.
+
+`pin` is used (not pinterest-downloader.py directly) because it already wraps
+the download with your hash-based dedup and random-renaming, consistent with
+the rest of the pfp-bot pipeline. Because `pin` hardcodes its own output
+directory, there's no "save directory" field here — it always goes wherever
+your pin script sends it.
+"""
+import asyncio
+import json
+import re
+import shutil
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional
+
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.reactive import reactive
+from textual.widgets import (
+    Header,
+    Footer,
+    Input,
+    Button,
+    Checkbox,
+    Static,
+    RichLog,
+    ListView,
+    ListItem,
+    Label,
+    TabbedContent,
+    TabPane,
+)
+
+CONFIG_PATH = Path(__file__).parent / ".pinterest_tui_config.json"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+# Shared OMArchy theme file. The TUI's colors adapt live to whichever theme is
+# currently active. Falls back to warm-neutral defaults if the file is missing.
+COLORS_TOML = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
+
+DEFAULT_COLORS = {
+    "bg": "#121113",
+    "fg": "#c1c1c1",
+    "muted": "#999999",
+    "dark": "#171618",
+    "card": "#1c1b1d",
+    "border": "#2b2b2b",
+    "accent": "#fbcb97",
+    "teal": "#5f8787",
+    "terra": "#e78a53",
+    "hover": "#222222",
+    "sel": "#333333",
+}
+
+
+def load_colors() -> dict:
+    """Read the active omarchy colors.toml into a palette dict.
+
+    The TUI needs a few semantic roles (accent, muted, surface, border).
+    How they map from colors.toml:
+        accent -> accent
+        fg / muted -> foreground / muted
+        card / dark / border -> lighter_background / dark_background / border
+        teal / terra -> color1 / color3 (the two warm-ish accents in the theme)
+    """
+    palette = dict(DEFAULT_COLORS)
+    try:
+        text = COLORS_TOML.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return palette
+    vals = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        val = raw.strip().strip('"').strip("'").strip()
+        if val.startswith("#") and len(val) == 7:
+            vals[key.strip()] = val
+    palette["bg"] = vals.get("background", palette["bg"])
+    palette["fg"] = vals.get("foreground", palette["fg"])
+    palette["muted"] = vals.get("muted", palette["muted"])
+    palette["dark"] = vals.get("dark_background", palette["dark"])
+    palette["card"] = vals.get("lighter_background", palette["card"])
+    palette["border"] = vals.get("border", palette["border"])
+    palette["accent"] = vals.get("accent", palette["accent"])
+    palette["hover"] = vals.get("hover", palette["hover"])
+    palette["sel"] = vals.get("selection", palette["sel"])
+    palette["teal"] = vals.get("color1", palette["teal"])
+    palette["terra"] = vals.get("color3", palette["terra"])
+    return palette
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def find_pin_command() -> str:
+    """Prefer a `pin` on PATH (how the README examples invoke it); fall back
+    to a `pin` script sitting next to this file."""
+    on_path = shutil.which("pin")
+    if on_path:
+        return on_path
+    local = Path(__file__).parent / "pin"
+    if local.exists():
+        return str(local)
+    return "pin"  # let it fail loudly at run time with a clear "not found" error
+
+
+@dataclass
+class JobOptions:
+    path: str = ""
+    threads: str = ""  # blank -> script default
+    cut: str = ""  # blank -> script default (-1)
+    force: bool = False
+    exclude_section: bool = False
+    rescrape: bool = False
+    img_only: bool = False
+    v_only: bool = False
+    board_timestamp: bool = False
+    log_timestamp: bool = False
+    https_proxy: str = ""
+    http_proxy: str = ""
+    cookies: str = ""
+
+    def build_args(self) -> list[str]:
+        """Builds the argument list passed to `pin` (which forwards them
+        straight through to pinterest-downloader.py, then appends its own
+        -d/--dir last — so we deliberately never pass -d/--dir here, since
+        pin's own copy would win anyway)."""
+        args: list[str] = []
+        if self.threads.strip():
+            args += ["--job", self.threads.strip()]
+        if self.cut.strip():
+            args += ["--cut", self.cut.strip()]
+        if self.board_timestamp:
+            args.append("--board-timestamp")
+        if self.log_timestamp:
+            args.append("--log-timestamp")
+        if self.force:
+            args.append("--force")
+        if self.exclude_section:
+            args.append("--exclude-section")
+        if self.rescrape:
+            args.append("--re-scrape")
+        if self.img_only:
+            args.append("--image-only")
+        if self.v_only:
+            args.append("--video-only")
+        if self.https_proxy.strip():
+            args += ["--https-proxy", self.https_proxy.strip()]
+        if self.http_proxy.strip():
+            args += ["--http-proxy", self.http_proxy.strip()]
+        if self.cookies.strip():
+            args += ["--cookies", self.cookies.strip()]
+        args.append(self.path.strip())
+        return args
+
+
+@dataclass
+class Job:
+    options: JobOptions
+    status: str = "queued"  # queued -> running -> done | error | stopped
+    list_item: Optional[ListItem] = field(default=None, repr=False)
+
+
+PERSISTED_FIELDS = [
+    "threads",
+    "cut",
+    "https_proxy",
+    "http_proxy",
+    "cookies",
+    "force",
+    "exclude_section",
+    "rescrape",
+    "img_only",
+    "v_only",
+    "board_timestamp",
+    "log_timestamp",
+]
+
+
+def load_defaults() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_defaults(options: JobOptions) -> None:
+    data = {k: v for k, v in asdict(options).items() if k in PERSISTED_FIELDS}
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
+class PinterestTUI(App):
+    # The CSS is a template: {c} is a dict of colors pulled from colors.toml at
+    # startup so the whole UI adapts to the active omarchy theme. Tabbed Panels
+    # layout: appbar > tab strip > (form | log | queue rail) grid.
+    CSS = """
+    Screen {
+        layout: vertical;
+        background: {c[bg]};
+        color: {c[fg]};
+    }
+    Header {
+        background: {c[card]};
+        color: {c[fg]};
+    }
+    Footer {
+        background: {c[card]};
+        color: {c[muted]};
+    }
+    /* appbar */
+    #appbar {
+        height: 3;
+        dock: top;
+        layout: horizontal;
+        align-vertical: middle;
+        border-bottom: tall {c[accent]};
+        padding: 0 2;
+        background: {c[bg]};
+    }
+    #appbar .title {
+        text-style: bold;
+        color: {c[accent]};
+    }
+    #appbar .tag {
+        color: {c[muted]};
+        text-style: italic;
+    }
+    /* tab strip */
+    #tabs {
+        height: auto;
+        dock: top;
+        layout: horizontal;
+        background: {c[bg]};
+        border-bottom: tall {c[border]};
+    }
+    #tabs > .tab {
+        padding: 0 2;
+        height: 3;
+        color: {c[muted]};
+        background: {c[dark]};
+        border: tall {c[border]};
+    }
+    #tabs > .tab.-active {
+        color: {c[accent]};
+        background: {c[card]};
+        border: tall {c[accent]};
+    }
+    /* main content grid: left form+log, right queue rail */
+    #content {
+        height: 1fr;
+        layout: horizontal;
+        margin: 1 1 0 1;
+    }
+    #left {
+        width: 2fr;
+        layout: vertical;
+        margin-right: 1;
+    }
+    #form {
+        height: auto;
+        border: tall {c[border]};
+        background: {c[card]};
+        padding: 1 2;
+    }
+    #form Input {
+        margin-bottom: 1;
+        background: {c[dark]};
+        color: {c[fg]};
+        border: tall {c[border]};
+    }
+    #form Input:focus {
+        border: tall {c[accent]};
+    }
+    #checkboxes {
+        height: auto;
+        layout: grid;
+        grid-size: 2;
+        grid-gutter: 0 2;
+        margin-bottom: 1;
+        background: {c[card]};
+        color: {c[fg]};
+    }
+    Checkbox { background: {c[card]}; color: {c[fg]}; }
+    Checkbox > .toggle { color: {c[accent]}; }
+    #buttons {
+        height: auto;
+        layout: horizontal;
+    }
+    #buttons Button {
+        margin-right: 1;
+        background: {c[dark]};
+        color: {c[fg]};
+        border: tall {c[border]};
+    }
+    #buttons Button:hover { border: tall {c[accent]}; color: {c[accent]}; }
+    #buttons #add { background: {c[accent]}; color: {c[bg]}; }
+    #buttons #start { background: {c[teal]}; color: {c[bg]}; }
+    #buttons #stop { background: {c[terra]}; color: {c[bg]}; }
+    /* big log panel */
+    #log-panel {
+        border: tall {c[border]};
+        background: {c[card]};
+        margin-top: 1;
+        height: 1fr;
+        padding: 0 1;
+    }
+    #log-panel Label {
+        color: {c[teal]};
+        text-style: bold;
+        padding: 0 0 1 0;
+    }
+    #log {
+        background: {c[dark]};
+        border: tall {c[border]};
+        color: {c[muted]};
+        height: 1fr;
+        padding: 0 1;
+    }
+    /* queue rail */
+    #queue-panel {
+        width: 34;
+        border: tall {c[border]};
+        background: {c[card]};
+        padding: 0 1;
+    }
+    #queue-panel Label {
+        color: {c[teal]};
+        text-style: bold;
+        padding: 1 0;
+    }
+    #queue-list {
+        height: 1fr;
+        background: {c[card]};
+        border: none;
+    }
+    #queue-list ListItem {
+        background: {c[dark]};
+        color: {c[fg]};
+        border-left: tall {c[border]};
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    /* status line */
+    #status-line {
+        height: auto;
+        dock: bottom;
+        color: {c[muted]};
+        padding: 0 2;
+        background: {c[bg]};
+    }
+    """
+
+    BINDINGS = [
+        ("ctrl+q", "quit", "Quit"),
+        ("ctrl+r", "start_queue", "Start queue"),
+        ("ctrl+s", "stop_current", "Stop current"),
+    ]
+
+    def __init__(self):
+        self.palette = load_colors()
+        super().__init__()
+        # inject the palette into the CSS template so the whole theme adapts.
+        # Use plain token replacement (not str.format) because CSS uses {} for
+        # selectors, which would otherwise be misinterpreted as format fields.
+        css = self.CSS
+        for key, val in self.palette.items():
+            css = css.replace("{c[" + key + "]}", val)
+        self.CSS = css
+        self.jobs: list[Job] = []
+        self.running_process: Optional[asyncio.subprocess.Process] = None
+        self.queue_task: Optional[asyncio.Task] = None
+        self.pin_cmd = find_pin_command()
+        self.defaults = load_defaults()
+        self.tabs = None
+        self.active_tab = "job"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="appbar"):
+            yield Static("PINTEREST TUI", classes="title")
+            yield Static("DESIGN 3 / TABBED PANELS", classes="tag")
+        with Horizontal(id="tabs"):
+            yield Static("NEW JOB", classes="tab", id="tab-job")
+            yield Static("SETTINGS", classes="tab", id="tab-settings")
+            yield Static("HISTORY", classes="tab", id="tab-history")
+        with Horizontal(id="content"):
+            with Vertical(id="left"):
+                with Vertical(id="form"):
+                    yield Static(
+                        f"Downloads to wherever your `pin` script sends them ({self.pin_cmd})",
+                        id="pin-info",
+                    )
+                    yield Input(
+                        placeholder="Pinterest username, username/board, username/board/section, or URL",
+                        id="path",
+                    )
+                    with Horizontal():
+                        yield Input(placeholder="Threads (blank = auto)", id="threads")
+                        yield Input(placeholder="Cut length (blank = default)", id="cut")
+                    with Horizontal():
+                        yield Input(placeholder="HTTPS proxy (optional)", id="https_proxy")
+                        yield Input(placeholder="HTTP proxy (optional)", id="http_proxy")
+                    yield Input(placeholder="Cookies file path (optional, for secret boards)", id="cookies")
+                    with Vertical(id="checkboxes"):
+                        yield Checkbox("Force re-download", id="force")
+                        yield Checkbox("Exclude sections", id="exclude_section")
+                        yield Checkbox("Re-scrape all", id="rescrape")
+                        yield Checkbox("Image only", id="img_only")
+                        yield Checkbox("Video only", id="v_only")
+                        yield Checkbox("Board timestamp", id="board_timestamp")
+                        yield Checkbox("Log timestamp", id="log_timestamp")
+                    with Horizontal(id="buttons"):
+                        yield Button("Add to queue", id="add")
+                        yield Button("Start queue", id="start")
+                        yield Button("Stop current", id="stop")
+                        yield Button("Clear finished", id="clear")
+                with Vertical(id="log-panel"):
+                    yield Label("LOG \u2014 live output")
+                    yield RichLog(id="log", wrap=True, highlight=False, markup=False)
+            with Vertical(id="queue-panel"):
+                yield Label("QUEUE")
+                yield ListView(id="queue-list")
+        yield Static("", id="status-line")
+
+    def on_mount(self) -> None:
+        for key, value in self.defaults.items():
+            try:
+                widget = self.query_one(f"#{key}")
+            except Exception:
+                continue
+            if isinstance(widget, Checkbox):
+                widget.value = bool(value)
+            elif isinstance(widget, Input):
+                widget.value = str(value)
+        if not shutil.which("pin") and not (Path(__file__).parent / "pin").exists():
+            self.notify(
+                "Couldn't find a `pin` command on PATH or next to this file — "
+                "starting a job will fail until that's fixed.",
+                severity="warning",
+                timeout=8,
+            )
+        self.set_tab("tab-job")
+
+    def set_tab(self, tab_id: str) -> None:
+        """Highlight one of the top tab strip entries. SETTINGS/HISTORY are
+        placeholders for now; selecting them just moves the highlight."""
+        for tid in ("tab-job", "tab-settings", "tab-history"):
+            tab = self.query_one(f"#{tid}", Static)
+            tab.set_class(tid == tab_id, "-active")
+        self.active_tab = tab_id
+
+    def on_static_clicked(self, event: Static.Clicked) -> None:
+        if event.static.id in ("tab-job", "tab-settings", "tab-history"):
+            self.set_tab(event.static.id)
+
+    def read_form(self) -> JobOptions:
+        def val(id_: str) -> str:
+            return self.query_one(f"#{id_}", Input).value
+
+        def flag(id_: str) -> bool:
+            return self.query_one(f"#{id_}", Checkbox).value
+
+        return JobOptions(
+            path=val("path"),
+            threads=val("threads"),
+            cut=val("cut"),
+            https_proxy=val("https_proxy"),
+            http_proxy=val("http_proxy"),
+            cookies=val("cookies"),
+            force=flag("force"),
+            exclude_section=flag("exclude_section"),
+            rescrape=flag("rescrape"),
+            img_only=flag("img_only"),
+            v_only=flag("v_only"),
+            board_timestamp=flag("board_timestamp"),
+            log_timestamp=flag("log_timestamp"),
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "add":
+            self.action_add_job()
+        elif event.button.id == "start":
+            self.action_start_queue()
+        elif event.button.id == "stop":
+            self.action_stop_current()
+        elif event.button.id == "clear":
+            self.action_clear_finished()
+
+    def action_add_job(self) -> None:
+        options = self.read_form()
+        if not options.path.strip():
+            self.notify("Enter a username, board, section, or URL first.", severity="warning")
+            return
+
+        save_defaults(options)
+
+        job = Job(options=options)
+        list_view = self.query_one("#queue-list", ListView)
+        item = ListItem(Label(f"⏳ {options.path}"))
+        job.list_item = item
+        list_view.append(item)
+        self.jobs.append(job)
+
+        self.query_one("#path", Input).value = ""
+        self.query_one("#path", Input).focus()
+
+    def action_start_queue(self) -> None:
+        if self.queue_task and not self.queue_task.done():
+            self.notify("Queue is already running.", severity="information")
+            return
+        if not any(j.status == "queued" for j in self.jobs):
+            self.notify("Nothing queued.", severity="information")
+            return
+        self.queue_task = asyncio.create_task(self.run_queue())
+
+    def action_stop_current(self) -> None:
+        if self.running_process and self.running_process.returncode is None:
+            self.running_process.terminate()
+            self.set_status_line("Stopping current job...")
+        else:
+            self.notify("Nothing is running right now.", severity="information")
+
+    def action_clear_finished(self) -> None:
+        remaining = []
+        for job in self.jobs:
+            if job.status in ("done", "error", "stopped"):
+                job.list_item.remove()
+            else:
+                remaining.append(job)
+        self.jobs = remaining
+
+    def set_status_line(self, text: str) -> None:
+        self.query_one("#status-line", Static).update(text)
+
+    def set_job_status(self, job: Job, status: str, icon: str) -> None:
+        job.status = status
+        label = job.list_item.query_one(Label)
+        label.update(f"{icon} {job.options.path}")
+
+    async def run_queue(self) -> None:
+        log = self.query_one("#log", RichLog)
+        for job in self.jobs:
+            if job.status != "queued":
+                continue
+
+            self.set_job_status(job, "running", "▶")
+            log.write(f"\n=== Starting: {job.options.path} ===")
+            self.set_status_line(f"Running: {job.options.path}")
+
+            args = [self.pin_cmd] + job.options.build_args()
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except FileNotFoundError:
+                log.write(f"[error] Could not run '{self.pin_cmd}' — is it on PATH or next to this file?")
+                self.set_job_status(job, "error", "✖")
+                continue
+
+            self.running_process = process
+            await self.stream_output(process, log)
+            returncode = await process.wait()
+            self.running_process = None
+
+            if returncode == 0:
+                self.set_job_status(job, "done", "✔")
+                log.write(f"=== Finished: {job.options.path} ===")
+            elif returncode < 0:
+                self.set_job_status(job, "stopped", "⏹")
+                log.write(f"=== Stopped: {job.options.path} ===")
+            else:
+                self.set_job_status(job, "error", "✖")
+                log.write(f"=== Failed (exit {returncode}): {job.options.path} ===")
+
+        self.set_status_line("Queue idle.")
+
+    async def stream_output(self, process: "asyncio.subprocess.Process", log: RichLog) -> None:
+        """Reads raw chunks (not line-buffered) so \\r-terminated progress-bar
+        updates are caught too, not just \\n-terminated log lines. \\n lines go
+        to the scrolling log; \\r updates go to the status line instead of
+        spamming the log with one line per percent."""
+        buffer = ""
+        assert process.stdout is not None
+        while True:
+            chunk = await process.stdout.read(256)
+            if not chunk:
+                break
+            buffer += chunk.decode(errors="replace")
+            while True:
+                idx_n = buffer.find("\n")
+                idx_r = buffer.find("\r")
+                candidates = [i for i in (idx_n, idx_r) if i != -1]
+                if not candidates:
+                    break
+                idx = min(candidates)
+                piece, buffer = buffer[:idx], buffer[idx + 1 :]
+                is_newline = idx == idx_n
+                text = strip_ansi(piece).strip()
+                if not text:
+                    continue
+                if is_newline:
+                    log.write(text)
+                else:
+                    self.set_status_line(text)
+        remainder = strip_ansi(buffer).strip()
+        if remainder:
+            log.write(remainder)
+
+
+if __name__ == "__main__":
+    PinterestTUI().run()

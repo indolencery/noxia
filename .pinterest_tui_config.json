@@ -1,0 +1,14 @@
+{
+  "threads": "",
+  "cut": "",
+  "force": false,
+  "exclude_section": false,
+  "rescrape": false,
+  "img_only": false,
+  "v_only": false,
+  "board_timestamp": false,
+  "log_timestamp": false,
+  "https_proxy": "",
+  "http_proxy": "",
+  "cookies": ""
+}
