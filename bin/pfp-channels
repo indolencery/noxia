@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# pfp-channels — manage the pfp auto-routing channel manifest.
+#
+# A "channel" here is auto-routed by folder: drop images into
+#   ~/pfp-bot/pfps/<channel-name>/
+# and the running bot auto-sends them to the Discord channel of that name.
+#
+# Manifest lives at ~/pfp-bot/pfps/.channels.json as a JSON list of:
+#   [{"id": "<channel id>", "name": "<channel name>", "folder": "<folder>"}]
+# "folder" is the directory name under pfps/ that auto-routes to that channel.
+#
+# Usage:
+#   pfp-channels list                — print the current channels (one per line: id|name|folder)
+#   pfp-channels add <id> <name>     — add/replace a channel (creates its pfps/<name>/ folder)
+#   pfp-channels remove <id-or-name> — remove a channel
+#   pfp-channels ensure-folders      — create a pfps/<name>/ folder for every channel
+#   pfp-channels match <folder>      — echo the channel id whose folder case-insensitively
+#                                      equals <folder> (exit 0 if matched, 1 if not)
+#
+# Additions also append the channel id to RANDOM_PFP_CHANNELS in .env so the
+# /random command picks it up on next bot start.
+
+set -euo pipefail
+
+PFP_ROOT="$HOME/pfp-bot/pfps"
+MANIFEST="$PFP_ROOT/.channels.json"
+ENV_FILE="$HOME/pfp-bot/.env"
+
+mkdir -p "$PFP_ROOT"
+
+# ---- manifest IO -------------------------------------------------------
+ensure_manifest() {
+  if [ ! -f "$MANIFEST" ]; then
+    echo '[]' > "$MANIFEST"
+  fi
+}
+
+read_manifest() {
+  # returns the json as a single line
+  ensure_manifest
+  tr -d '\n\r' < "$MANIFEST"
+}
+
+write_manifest() {
+  # $1 = fully formed json array
+  cat > "$MANIFEST" <<< "$1"
+}
+
+# ---- RANDOM_PFP_CHANNELS sync ----------------------------------------
+append_to_random_channels() {
+  # $1 = channel id to add
+  local id="$1"
+  if [ ! -f "$ENV_FILE" ]; then
+    return
+  fi
+  if grep -q "RANDOM_PFP_CHANNELS=" "$ENV_FILE" 2>/dev/null; then
+    local cur
+    cur="$(grep '^RANDOM_PFP_CHANNELS=' "$ENV_FILE" | head -1 | cut -d= -f2-)"
+    if [[ ",$cur," != *",$id,"* ]]; then
+      local new
+      if [ -z "$cur" ]; then
+        new="$id"
+      else
+        new="$cur,$id"
+      fi
+      sed -i "s|^RANDOM_PFP_CHANNELS=.*|RANDOM_PFP_CHANNELS=$new|" "$ENV_FILE"
+    fi
+  else
+    printf 'RANDOM_PFP_CHANNELS=%s\n' "$id" >> "$ENV_FILE"
+  fi
+}
+
+remove_from_random_channels() {
+  local id="$1"
+  if [ ! -f "$ENV_FILE" ]; then
+    return
+  fi
+  sed -i "s|^RANDOM_PFP_CHANNELS=.*|RANDOM_PFP_CHANNELS=|" "$ENV_FILE"
+  # rebuild from manifest so it stays consistent
+  local ids=""
+  while IFS='|' read -r cid cname cfolder; do
+    [ -z "$cid" ] && continue
+    if [ -z "$ids" ]; then ids="$cid"; else ids="$ids,$cid"; fi
+  done < <(pfp-channels list)
+  if [ -n "$ids" ]; then
+    sed -i "s|^RANDOM_PFP_CHANNELS=.*|RANDOM_PFP_CHANNELS=$ids|" "$ENV_FILE"
+  fi
+}
+
+# ---- commands ---------------------------------------------------------
+cmd_list() {
+  ensure_manifest
+  local json
+  json="$(read_manifest)"
+  python3 - "$json" <<'PY'
+import json, sys
+try:
+    arr = json.loads(sys.argv[1])
+except Exception:
+    arr = []
+for e in arr:
+    print(f"{e.get('id','')}|{e.get('name','')}|{e.get('folder', e.get('name',''))}")
+PY
+}
+
+cmd_add() {
+  local id="$1" name="$2"
+  ensure_manifest
+  local json
+  json="$(read_manifest)"
+  local name_lower
+  name_lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  local out
+  out="$(python3 - "$json" "$id" "$name" "$name_lower" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+id_, name, folder = sys.argv[2], sys.argv[3], sys.argv[4]
+# replace existing id or name
+arr = [e for e in arr if e.get('id') != id_ and e.get('name','').lower() != name.lower()]
+arr.append({"id": id_, "name": name, "folder": folder})
+print(json.dumps(arr))
+PY
+)"
+  write_manifest "$out"
+  mkdir -p "$PFP_ROOT/$name_lower"
+  if [ -n "$id" ]; then
+    append_to_random_channels "$id"
+  fi
+  if [ -n "$id" ]; then
+    echo "OK: added channel $name ($id) — auto-route folder: pfps/$name_lower + /random"
+  else
+    echo "OK: added channel $name (no id — auto-route folder: pfps/$name_lower; /random not added)"
+  fi
+}
+
+cmd_remove() {
+  local target="$1"
+  ensure_manifest
+  local json
+  json="$(read_manifest)"
+  local out removed_id
+  out="$(python3 - "$json" "$target" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+t = sys.argv[2].lower()
+kept = []
+for e in arr:
+    if e.get('id') == t or e.get('name','').lower() == t or e.get('folder','').lower() == t:
+        continue
+    kept.append(e)
+print(json.dumps(kept))
+PY
+)"
+  write_manifest "$out"
+  remove_from_random_channels "$target"
+  echo "OK: removed $target"
+}
+
+cmd_ensure_folders() {
+  ensure_manifest
+  while IFS='|' read -r cid cname cfolder; do
+    [ -z "$cid" ] && continue
+    mkdir -p "$PFP_ROOT/$cfolder"
+  done < <(pfp-channels list)
+  echo "OK: folders ensured"
+}
+
+cmd_match() {
+  local input="$1"
+  # trim surrounding whitespace, then lowercase for the folder comparison
+  input="$(printf '%s' "$input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  local input_lower
+  input_lower="$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]')"
+  ensure_manifest
+  # If the input is already a bare channel id, match on id too
+  local result=""
+  while IFS='|' read -r cid cname cfolder; do
+    [ -z "$cid" ] && continue
+    local fl
+    fl="$(printf '%s' "$cfolder" | tr '[:upper:]' '[:lower:]')"
+    if [ "$fl" = "$input_lower" ] || [ "$cid" = "$input" ]; then
+      result="$cid"
+      break
+    fi
+  done < <(pfp-channels list)
+  if [ -n "$result" ]; then
+    echo "$result"
+    exit 0
+  fi
+  exit 1
+}
+
+# Rename a channel: updates the Discord channel name, the local pfps/<folder>,
+# the manifest (name+folder), and any `pin` alias targets that point at the old
+# folder. Usage: pfp-channels rename <id-or-folder> <new-name>
+cmd_rename() {
+  local target="$1" newname="$2"
+  if [ -z "$target" ] || [ -z "$newname" ]; then
+    echo "usage: pfp-channels rename <id-or-folder> <new-name>"
+    return 1
+  fi
+  ensure_manifest
+  local json
+  json="$(read_manifest)"
+
+  # Resolve the entry + new lowercased folder in Python.
+  local resolved
+  resolved="$(python3 - "$json" "$target" "$newname" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+t = sys.argv[2].lower()
+new = sys.argv[3]
+new_lower = new.lower()
+entry = None
+for e in arr:
+    if e.get('id') == t or e.get('name','').lower() == t or e.get('folder','').lower() == t:
+        entry = e
+        break
+if entry is None:
+    print("NOTFOUND", end="")
+else:
+    print(f"{entry.get('id','')}\t{entry.get('folder', entry.get('name','')).lower()}\t{new_lower}")
+PY
+)"
+  if [ "$resolved" = "NOTFOUND" ]; then
+    echo "ERROR: no channel matches '$target'"
+    return 1
+  fi
+  local old_id old_folder new_folder
+  IFS=$'\t' read -r old_id old_folder new_folder <<< "$resolved"
+  [ -z "$old_id" ] && [ -z "$old_folder" ] && echo "ERROR: unresolvable" && return 1
+  [ -z "$new_folder" ] && echo "ERROR: empty new name" && return 1
+
+  echo "Renaming channel: $old_folder ($old_id) -> $newname (folder: $new_folder)"
+
+  # 1) Rename the local folder (keep sent/ and contents intact).
+  if [ -d "$PFP_ROOT/$old_folder" ]; then
+    if [ "$old_folder" != "$new_folder" ]; then
+      mv "$PFP_ROOT/$old_folder" "$PFP_ROOT/$new_folder"
+      echo "Renamed local folder pfps/$old_folder -> pfps/$new_folder"
+    fi
+  else
+    echo "WARN: folder pfps/$old_folder not present (skipping folder rename)"
+  fi
+
+  # 2) Update the manifest (name + folder). id is unchanged.
+  local out
+  out="$(python3 - "$json" "$old_id" "$old_folder" "$newname" "$new_folder" <<'PY'
+import json, sys
+arr = json.loads(sys.argv[1])
+old_id, old_folder, newname, new_folder = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+for e in arr:
+    if old_id and e.get('id') == old_id:
+        e['name'] = newname
+        e['folder'] = new_folder
+        break
+    elif e.get('folder','').lower() == old_folder:
+        e['name'] = newname
+        e['folder'] = new_folder
+        break
+print(json.dumps(arr))
+PY
+)"
+  write_manifest "$out"
+  echo "Updated .channels.json (name=$newname, folder=$new_folder)"
+
+  # 3) Update any `pin` alias targets that pointed at the old folder.
+  #    Matches the VALUE position (": \"<old>\"") only, never keys.
+  local PIN_SCRIPT="$HOME/.local/bin/pin"
+  if [ -f "$PIN_SCRIPT" ]; then
+    local squoted_old squoted_new
+    squoted_old="$(printf '%s' "$old_folder" | sed 's/[][\\^$.|*+?(){}]/\\&/g')"
+    squoted_new="$(printf '%s' "$new_folder" | sed 's/[][\\^$.|*+?(){}]/\\&/g')"
+    if grep -q ":\s*\"$old_folder\"" "$PIN_SCRIPT" 2>/dev/null; then
+      sed -i "s|: \"$squoted_old\"|: \"$squoted_new\"|g" "$PIN_SCRIPT"
+      echo "Updated pin alias targets: \"$old_folder\" -> \"$new_folder\""
+    fi
+  fi
+
+  # 4) Rename the Discord channel (best-effort; needs a token + MANAGE_CHANNELS).
+  if [ -n "$old_id" ] && [ -f "$ENV_FILE" ]; then
+    local token
+    token="$(grep '^DISCORD_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2-)"
+    if [ -n "$token" ]; then
+      local body
+      body="$(printf '{"name":"%s"}' "$newname")"
+      local resp
+      resp="$(curl -s -X PATCH "https://discord.com/api/v10/channels/$old_id" \
+        -H "Authorization: Bot $token" -H "Content-Type: application/json" \
+        -d "$body")"
+      if [ -n "$resp" ] && ! printf '%s' "$resp" | grep -q '"code":'; then
+        echo "Renamed Discord channel to #$newname"
+      else
+        # Couldn't rename on Discord (permission/token). Local side still done.
+        local emsg
+        emsg="$(printf '%s' "$resp" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("message",""))
+except Exception: print("")' 2>/dev/null)"
+        echo "WARN: could not auto-rename Discord channel (#$newname). Local rename done. Reason: ${emsg:-unknown}. Rename it manually in Discord."
+      fi
+    else
+      echo "WARN: no DISCORD_TOKEN in .env — renamed locally only; rename the channel manually in Discord."
+    fi
+  fi
+
+  echo "Done. Auto-route folder is now pfps/$new_folder"
+}
+
+case "${1:-list}" in
+  list) cmd_list ;;
+  add) cmd_add "$2" "${3:-}" ;;
+  remove) cmd_remove "$2" ;;
+  rename) cmd_rename "$2" "${3:-}" ;;
+  ensure-folders) cmd_ensure_folders ;;
+  match) cmd_match "$2" ;;
+  *) echo "usage: pfp-channels {list|add <id> <name>|remove <id-or-name>|rename <id-or-folder> <new-name>|ensure-folders|match <folder>}"; exit 1 ;;
+esac

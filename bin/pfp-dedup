@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Image deduplication utility - uses MD5 hashes to detect duplicate images
+# Usage: pfp-dedup <command> [args]
+# Commands:
+#   scan [dir]     - Scan directory and build/update hash database
+#   check <file>   - Check if file exists in database
+#   add <file>     - Add file to database (after confirming it's new)
+#   stats          - Show database statistics
+#   rebuild        - Rebuild database from scratch
+
+set -euo pipefail
+
+HASH_DB="$HOME/pfp-bot/image-hashes.txt"
+BOT_PFPS="$HOME/pfp-bot/pfps"
+
+# Initialize hash database if it doesn't exist
+init_db() {
+  if [ ! -f "$HASH_DB" ]; then
+    echo "# Image hash database - DO NOT EDIT MANUALLY" > "$HASH_DB"
+    echo "# Format: md5hash|filename|added_date" >> "$HASH_DB"
+    echo "Initialized hash database: $HASH_DB"
+  fi
+}
+
+# Get MD5 hash of a file
+get_hash() {
+  local file="$1"
+  md5sum "$file" 2>/dev/null | cut -d' ' -f1
+}
+
+# Check if hash exists in database
+hash_exists() {
+  local hash="$1"
+  grep -q "^$hash|" "$HASH_DB" 2>/dev/null
+}
+
+# Add hash to database
+add_hash() {
+  local file="$1"
+  local hash="$2"
+  local filename="$3"
+  local date=$(date +%Y-%m-%d)
+  echo "$hash|$filename|$date" >> "$HASH_DB"
+}
+
+# Scan directory and build database
+scan_dir() {
+  local dir="${1:-$BOT_PFPS}"
+  local count=0
+  local new=0
+  local dupes=0
+  
+  echo "Scanning $dir for images..."
+  
+  while IFS= read -r -d '' file; do
+    count=$((count + 1))
+    local hash=$(get_hash "$file")
+    local filename=$(basename "$file")
+    
+    if hash_exists "$hash"; then
+      dupes=$((dupes + 1))
+      echo "  DUPE: $filename (hash exists)"
+    else
+      add_hash "$file" "$hash" "$filename"
+      new=$((new + 1))
+      echo "  NEW: $filename"
+    fi
+  done < <(find "$dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) -print0)
+  
+  echo ""
+  echo "Scan complete:"
+  echo "  Total images: $count"
+  echo "  New added: $new"
+  echo "  Duplicates found: $dupes"
+}
+
+# Check if a file is a duplicate
+check_file() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    echo "Error: File not found: $file"
+    return 1
+  fi
+  
+  local hash=$(get_hash "$file")
+  if hash_exists "$hash"; then
+    echo "DUPLICATE: $file (hash: $hash)"
+    return 0
+  else
+    echo "NEW: $file (hash: $hash)"
+    return 1
+  fi
+}
+
+# Add file to database
+add_file() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    echo "Error: File not found: $file"
+    return 1
+  fi
+  
+  local hash=$(get_hash "$file")
+  local filename=$(basename "$file")
+  
+  if hash_exists "$hash"; then
+    echo "DUPLICATE: $filename (hash: $hash)"
+    return 1
+  else
+    add_hash "$file" "$hash" "$filename"
+    echo "ADDED: $filename (hash: $hash)"
+    return 0
+  fi
+}
+
+# Show database statistics
+show_stats() {
+  if [ ! -f "$HASH_DB" ]; then
+    echo "No hash database found"
+    return
+  fi
+  
+  local total=$(grep -v '^#' "$HASH_DB" | grep -c '|' || true)
+  local today=$(grep -v '^#' "$HASH_DB" | grep -c "$(date +%Y-%m-%d)" || true)
+  local oldest=$(grep -v '^#' "$HASH_DB" | head -1 | cut -d'|' -f3 || echo "N/A")
+  local newest=$(grep -v '^#' "$HASH_DB" | tail -1 | cut -d'|' -f3 || echo "N/A")
+  
+  echo "Hash Database Statistics:"
+  echo "  Total hashes: $total"
+  echo "  Added today: $today"
+  echo "  Oldest entry: $oldest"
+  echo "  Newest entry: $newest"
+  echo "  Database file: $HASH_DB"
+}
+
+# Rebuild database from scratch
+rebuild_db() {
+  echo "Rebuilding hash database..."
+  echo "# Image hash database - DO NOT EDIT MANUALLY" > "$HASH_DB"
+  echo "# Format: md5hash|filename|added_date" >> "$HASH_DB"
+  scan_dir "$BOT_PFPS"
+}
+
+# Remove duplicate files within the scanned folder. Tracks hashes SEEN THIS RUN
+# in memory and only removes the 2nd-and-later occurrence of each hash. It does
+# NOT consult the persisted hash database (image-hashes.txt) — every file that
+# was legitimately added via pin/pfp-add/scan already has its hash in there, so
+# comparing against it would wrongly flag nearly the whole collection.
+cleanup_duplicates() {
+  local dir="${1:-$BOT_PFPS}"
+  local dry_run="${2:-false}"
+  local count=0
+  local removed=0
+  declare -A seen=()
+
+  echo "Scanning $dir for duplicate images (within this folder)..."
+
+  while IFS= read -r -d '' file; do
+    local hash=$(get_hash "$file")
+    local filename=$(basename "$file")
+
+    if [ -n "${seen[$hash]:-}" ]; then
+      count=$((count + 1))
+      if [ "$dry_run" = "true" ]; then
+        echo "  WOULD REMOVE: $filename (duplicates ${seen[$hash]})"
+      else
+        rm "$file"
+        echo "  REMOVED: $filename (duplicates ${seen[$hash]})"
+        removed=$((removed + 1))
+      fi
+    else
+      seen["$hash"]="$filename"
+    fi
+  done < <(find "$dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) -print0 | sort -z)
+
+  echo ""
+  echo "Scan complete:"
+  echo "  Duplicate images found: $count"
+  if [ "$dry_run" = "true" ]; then
+    echo "  (dry run - no files removed)"
+    echo "  Run 'pfp-dedup cleanup --apply' to actually remove them"
+  else
+    echo "  Files removed: $removed"
+  fi
+}
+
+# Main command handler
+case "${1:-help}" in
+  scan)
+    init_db
+    scan_dir "${2:-$BOT_PFPS}"
+    ;;
+  check)
+    init_db
+    check_file "$2"
+    ;;
+  add)
+    init_db
+    add_file "$2"
+    ;;
+  stats)
+    show_stats
+    ;;
+  rebuild)
+    rebuild_db
+    ;;
+  cleanup)
+    init_db
+    if [ "${2:-}" = "--apply" ]; then
+      cleanup_duplicates "${3:-$BOT_PFPS}" "false"
+    else
+      cleanup_duplicates "${2:-$BOT_PFPS}" "true"
+    fi
+    ;;
+  help|*)
+    echo "Usage: pfp-dedup <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  scan [dir]           - Scan directory and build/update hash database"
+    echo "  check <file>         - Check if file exists in database"
+    echo "  add <file>           - Add file to database (after confirming it's new)"
+    echo "  stats                - Show database statistics"
+    echo "  rebuild              - Rebuild database from scratch"
+    echo "  cleanup [dir]        - Find duplicates (dry run)"
+    echo "  cleanup --apply [dir] - Remove duplicate files (keeps first occurrence)"
+    ;;
+esac

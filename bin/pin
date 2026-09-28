@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# pin — download Pinterest images and drop them straight into an EXISTING
+# pfps/<channel>/ folder.
+#
+# Each downloaded image is renamed to a short random name, deduped against the
+# hash database, and moved into an existing TOP-LEVEL folder under $PFP_ROOT
+# whose name fuzzy-matches the board/section it came from. no NEW folder is ever
+# created. That folder name IS the Discord channel: a folder like pfps/thighs/
+# auto-sends to the #thighs channel (the running bot watches $PFP_ROOT and
+# routes by subfolder name == channel name/id).
+#
+# Pinterest display names (e.g. "%half face pfps", "@Female pfps_<timestamp>")
+# don't equal the kebab-case channel folders ("half-face", "female-pfp"), so we
+# do a leading-token match: strip the showcase prefix (@ % = !), lowercase,
+# collapse punctuation, then check whether the channel folder's tokens appear as
+# a leading sequence of the board name's tokens (thigh~thighs, pfp~pfps both
+# count as a match). The best-scoring unique channel wins.
+#
+# If no existing folder matches, the image falls to the pfps/ root where the
+# bot's dropdown picker routes it manually.
+#
+# Make your own pfps/<channel>/ folder (or use the TUI "ADD PFP CHANNEL") and
+# any download whose board/section matches lands right in it.
+
+PINS_DIR="$HOME/pfp-bot/pins"          # kept as the downloader's staging area
+STAGE="$HOME/.cache/pin-download"       # fresh copy to flatten from (kept clean)
+LOG_FILE="/tmp/pin-download.log"
+HASH_DB="$HOME/pfp-bot/image-hashes.txt"
+PFP_ROOT="$HOME/pfp-bot/pfps"
+
+mkdir -p "$PINS_DIR" "$STAGE" "$PFP_ROOT"
+
+# Initialize hash database if it doesn't exist
+if [ ! -f "$HASH_DB" ]; then
+  echo "# Image hash database - DO NOT EDIT MANUALLY" > "$HASH_DB"
+  echo "# Format: md5hash|filename|added_date" >> "$HASH_DB"
+fi
+
+echo "Downloading to: $STAGE (staging) -> dropping into: $PFP_ROOT/<board-or-section>/"
+
+# Scrape straight into the staging area.
+python3 ~/pinterest-downloader/pinterest-downloader.py "$@" -d "$STAGE" 2>&1 | tee "$LOG_FILE"
+
+# Flatten: every image goes into an EXISTING top-level pfps/<channel>/ folder
+# matching its board/section name (case-insensitive). We never create a new
+# folder — if nothing matches, the image falls to the pfps root where the bot's
+# dropdown picker lets you route it manually.
+declare -A ROUTED        # mapped so far, by channel folder
+declare -A UNROUTED
+pending=()
+while IFS= read -r -d '' file; do
+  pending+=("$file")
+done < <(find "$STAGE" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) -print0)
+
+# Snapshot the folders that already exist under pfps/ (top-level only). The bot
+# routes by subfolder name == channel, so these ARE the router.
+existing=()
+for d in "$PFP_ROOT"/*/; do
+  [ -d "$d" ] && existing+=("$(basename "$d")")
+done
+
+find_channel() {
+  # $1 = board/section display name -> echo the existing pfps subfolder it maps
+  # to, or '' if none.
+  #
+  # Fuzzy leading-token match: Pinterest display names (e.g. "@Female pfps",
+  # "%half face pfps_2026-08-30 13_10_15_d") don't equal the kebab-case Discord
+  # channel folders ("female-pfp", "half-face"). We strip the sanitizer/showcase
+  # prefix (@ % = !), lowercase, collapse non-alphanumerics, then check whether
+  # the channel folder's tokens appear as a leading sequence of the board name's
+  # tokens (token-prefix tolerant: thigh~thighs, pfp~pfps). Best score wins;
+  # if nothing matches it echoes '' so the image falls to the pfps root.
+  python3 - "$1" "${existing[@]}" <<'PY'
+import sys, re
+def pfx(a, b):
+    return a.startswith(b) or b.startswith(a)
+def tok(s):
+    s = re.sub(r'^[%@=!~#&+*.\-]+', '', s).lower()
+    return re.sub(r'[^a-z0-9]+', ' ', s).strip().split()
+board = sys.argv[1]
+btoks = tok(board)
+
+# Explicit board/keyword -> channel-folder aliases, checked first. Add any
+# Pinterest board/name that maps to a channel whose name doesn't match it
+# naturally (e.g. "ghetto pfps" -> darkskin-female). Keys are matched as a
+# substring of the (prefix/suffix stripped, lowercased) board name.
+ALIASES = {
+    "ghetto": "darkskin-female",
+    "ghetto pfps": "darkskin-female",
+    "female": "white-female-pfp",
+    "female-pfps": "white-female-pfp",
+}
+board_l = re.sub(r'^[%@=!~#&+*.\-]+', '', board).lower()
+for key, target in ALIASES.items():
+    if key in board_l and target in sys.argv[2:]:
+        sys.stdout.write(target)
+        raise SystemExit(0)
+
+best = None
+best_score = -1
+for f in sys.argv[2:]:
+    ftoks = tok(f)
+    if not ftoks or len(ftoks) > len(btoks):
+        continue
+    if all(pfx(ft, bt) for ft, bt in zip(ftoks, btoks)):
+        score = sum(len(ft) for ft in ftoks)
+        if score > best_score:
+            best_score, best = score, f
+if best:
+    sys.stdout.write(best)
+PY
+}
+
+count=0
+deleted=0
+skipped=0
+unmatched=0
+for file in "${pending[@]}"; do
+  ctxdir="$(dirname "$file")"
+  base="$(basename "$file")"
+  ext="${base##*.}"
+
+  # Skip files that already have a short random name
+  if [[ "$base" =~ ^[A-Za-z0-9]{4,5}\.(jpg|jpeg|png|webp|gif)$ ]]; then
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  hash=$(md5sum "$file" 2>/dev/null | cut -d' ' -f1)
+  [ -z "$hash" ] && continue
+
+  # Already-seen image? Drop it (re-download).
+  if grep -q "^$hash|" "$HASH_DB" 2>/dev/null; then
+    rm -f "$file"
+    deleted=$((deleted + 1))
+    continue
+  fi
+
+  # Match against EXISTING folders only.
+  name_src="${ctxdir##*/}"
+  channel="$(find_channel "$name_src" || true)"
+
+  if [ -n "$channel" ]; then
+    dest_dir="$PFP_ROOT/$channel"
+  else
+    dest_dir="$PFP_ROOT"   # no match — root, hits the dropdown picker
+    unmatched=$((unmatched + 1))
+    UNROUTED["$name_src"]=$((${UNROUTED["$name_src"]:-0} + 1))
+  fi
+  # Random name, regenerating until unique in the destination — otherwise a
+  # colliding 4-5 char name would silently overwrite an earlier image.
+  ext="${base##*.}"
+  len=$((RANDOM % 2 + 4))
+  name=$(head -c 100 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c $len)
+  dest="$dest_dir/${name}.${ext}"
+  while [ -e "$dest" ]; do
+    len=$((RANDOM % 2 + 4))
+    name=$(head -c 100 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c $len)
+    dest="$dest_dir/${name}.${ext}"
+  done
+  mv "$file" "$dest"
+
+  date=$(date +%Y-%m-%d)
+  echo "$hash|$dest|$date" >> "$HASH_DB"
+  if [ -n "$channel" ]; then
+    ROUTED["$channel"]=$((${ROUTED["$channel"]:-0} + 1))
+  fi
+  count=$((count + 1))
+done
+
+# Clean the staging area of the files we just harvested.
+find "$STAGE" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) -delete 2>/dev/null || true
+find "$STAGE" -type d -empty -delete 2>/dev/null || true
+
+echo ""
+echo "Done: $count new images dropped into pfps/, $deleted previously-downloaded deleted, $skipped already-short-named skipped"
+if [ "$count" -gt 0 ]; then
+  echo "Auto-routed by board/section folder name into EXISTING folders only:"
+  if [ "${#ROUTED[@]}" -gt 0 ]; then
+    for ch in "${!ROUTED[@]}"; do
+      echo "  pfps/$ch/  (${ROUTED[$ch]} images)"
+    done
+  else
+    echo "  (none)"
+  fi
+  if [ "$unmatched" -gt 0 ]; then
+    echo "No matching folder -> dropped into pfps/ root (dropdown picker routes them):"
+    for ch in "${!UNROUTED[@]}"; do
+      echo "  (root) from '$ch'  (${UNROUTED[$ch]} images)"
+    done
+  fi
+  echo ""
+  echo "Only EXISTING pfps/<channel>/ folders are used (no folders auto-created)."
+fi
+echo "Staging saved/cleared at: $STAGE"
+
+# Record this download in the TUI's history file so the dashboard can show
+# the most recent downloaded links.
+HISTORY="$HOME/noxia/download-history.json"
+: > /tmp/pin-hist-routes.json
+for ch in "${!ROUTED[@]}"; do
+  python3 -c "
+import json,sys
+try: data=json.load(open(sys.argv[1]))
+except Exception: data={}
+data[sys.argv[2]]=int(sys.argv[3])
+json.dump(data,open(sys.argv[1],'w'))
+" /tmp/pin-hist-routes.json "$ch" "${ROUTED[$ch]}"
+done
+ROUTES_JSON="$(cat /tmp/pin-hist-routes.json 2>/dev/null || echo '{}')"
+python3 - "$HISTORY" "${1:-}" "$count" "$deleted" "$unmatched" "$ROUTES_JSON" <<'PY'
+import json, sys, datetime, os
+path = sys.argv[1]
+entry_path = sys.argv[2]
+new = int(sys.argv[3])
+dup = int(sys.argv[4])
+unmatched = int(sys.argv[5])
+routes = json.loads(sys.argv[6]) if sys.argv[6] else {}
+rec = {
+    "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "path": entry_path,
+    "new": new,
+    "duplicates_deleted": dup,
+    "unmatched": unmatched,
+    "channels": routes,
+}
+try:
+    data = json.load(open(path)) if os.path.exists(path) and os.path.getsize(path) > 0 else []
+except Exception:
+    data = []
+data.append(rec)
+data = data[-60:]  # keep only the last 60 entries
+json.dump(data, open(path, "w"), indent=2)
+PY
+rm -f /tmp/pin-hist-routes.json

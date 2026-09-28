@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BOT_PFPS="$HOME/pfp-bot/pfps"
+DC_PFPS="$HOME/images/esadism/dc pfp"
+HASH_DB="$HOME/pfp-bot/image-hashes.txt"
+
+# Initialize hash database if it doesn't exist
+if [ ! -f "$HASH_DB" ]; then
+  echo "# Image hash database - DO NOT EDIT MANUALLY" > "$HASH_DB"
+  echo "# Format: md5hash|filename|added_date" >> "$HASH_DB"
+fi
+
+if [ ! -d "$BOT_PFPS" ]; then
+  echo "Error: $BOT_PFPS does not exist"
+  exit 1
+fi
+
+if [ ! -d "$DC_PFPS" ]; then
+  echo "Error: $DC_PFPS does not exist"
+  exit 1
+fi
+
+# Find all images in dc pfps (including subfolders)
+count=0
+skipped=0
+while IFS= read -r -d '' file; do
+  # Get hash of the file
+  hash=$(md5sum "$file" 2>/dev/null | cut -d' ' -f1)
+  filename=$(basename "$file")
+  
+  # Check if hash already exists in database
+  if grep -q "^$hash|" "$HASH_DB" 2>/dev/null; then
+    skipped=$((skipped + 1))
+    echo "  SKIP: $filename (already in database)"
+    continue
+  fi
+  
+  # Copy to bot folder with a random name, regenerating until unique in the
+  # destination (otherwise a colliding name would silently overwrite a file).
+  ext="${file##*.}"
+  len=$((RANDOM % 2 + 4))
+  name=$(head -c 100 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c $len)
+  dest="$BOT_PFPS/${name}.${ext}"
+  while [ -e "$dest" ]; do
+    len=$((RANDOM % 2 + 4))
+    name=$(head -c 100 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c $len)
+    dest="$BOT_PFPS/${name}.${ext}"
+  done
+  cp "$file" "$dest"
+
+  # Record the hash so a re-run skips it (this was missing, so pfp-add
+  # re-copied everything under new random names every time).
+  echo "$hash|$dest|$(date +%Y-%m-%d)" >> "$HASH_DB"
+
+  count=$((count + 1))
+  echo "  ADDED: $filename → ${name}.${ext}"
+done < <(find "$DC_PFPS" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) -print0)
+
+echo ""
+echo "Done: $count new images added, $skipped duplicates skipped"
