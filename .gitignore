@@ -15,3 +15,7 @@ __pycache__/
 downloads-history.json
 download-history.json
 cache/
+
+# Backups
+*.bak
+*.opencode-backup
